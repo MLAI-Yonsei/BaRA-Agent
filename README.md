@@ -1,4 +1,4 @@
-# Web Crawler
+# BaRA: BFS-and-Reflection Web Data Collection Agent}
 
 This repository provides:
 
