@@ -6,3 +6,6 @@ python-dotenv==1.1.1
 requests==2.32.5
 httpx==0.28.1
 Pillow==11.3.0
+tldextract==5.3.1
+langdetect==1.0.9
+scikit-learn==1.8.0

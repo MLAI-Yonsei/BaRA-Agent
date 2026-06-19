@@ -31,6 +31,10 @@ class Step1Manager:
             llm_provider=self.config.llm_provider,
             ollama_host=self.config.ollama_host,
             ollama_api_key=self.config.ollama_api_key,
+            ablation_no_bfs=self.config.ablation_no_bfs,
+            ablation_prompt_bfs=self.config.ablation_prompt_bfs,
+            ablation_llm_bfs=self.config.ablation_llm_bfs,
+            ablation_no_reflection=self.config.ablation_no_reflection,
         )
 
         if not result:

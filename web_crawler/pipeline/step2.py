@@ -18,5 +18,9 @@ class Step2Manager:
             ollama_host=self.config.ollama_host,
             ollama_api_key=self.config.ollama_api_key,
             step2_union_retry_attempts=self.config.step2_union_retry_attempts,
+            ablation_no_reflection=self.config.ablation_no_reflection,
+            ablation_retry_merge_mode=self.config.ablation_retry_merge_mode,
+            step2_model_name=self.config.step2_model_name,
+            step2_concurrency=self.config.step2_concurrency,
         ):
             yield sub_url, last_extracted_content, page_index

@@ -1,264 +1,307 @@
-# BaRA: BFS-and-Reflection Web Data Collection Agent
+# BaRA: Budget-constrained and Reliable Web Data Collection Agent
 
-This repository provides:
+BaRA is a deterministic Playwright-based crawler combined with an LLM-driven
+content extraction and an LLM-free verification module that filters
+hallucinated and unverifiable artifacts.
 
-- a browser-based crawling pipeline
-- step-by-step execution through a single entry point
-- an evaluation script for text, image, and video outputs
+## Pipeline
 
-The code is organized so that you can:
-
-- run the full pipeline at once
-- run Step 1 only
-- run Step 2 only
-- run Step 3 only
-- evaluate generated outputs separately
-
-## Repository Structure
-
-```text
-.
-├── requirements.txt
-├── README.md
-└── web_crawler/
-    ├── __init__.py
-    ├── main.py
-    ├── eval.py
-    └── pipeline/
-        ├── __init__.py
-        ├── runtime.py
-        ├── step1.py
-        ├── step2.py
-        └── step3.py
+```
+  Step 1 (Playwright BFS, no LLM)
+        |  links_bfs.json  (visited_order + by_depth)
+        v
+  Step 2 (LLM extraction with reflection + retry-merge)
+        |  step2_results.jsonl
+        v
+  Verification (LLM-free, 5 gates for image/video, 2 gates for text)
+        |  verification_records.jsonl
+        v
+  Final dataset (only artifacts whose final_decision == "include")
 ```
 
-## What Each File Does
+### Verification gates
 
-- `web_crawler/main.py`
-  - Main entry point for the crawler pipeline.
-  - Supports full execution and step-by-step execution with `--run_mode`.
-- `web_crawler/pipeline/step1.py`
-  - Link collection.
-- `web_crawler/pipeline/step2.py`
-  - Page-level content extraction.
-- `web_crawler/pipeline/step3.py`
-  - Content classification and output generation.
-- `web_crawler/eval.py`
-  - Evaluation for text, image, and video results.
+Image / Video Gate (5 gates, all must pass):
 
-## Requirements
+| Gate | Check |
+|------|-------|
+| T1 | Artifact URL is present in the source page's DOM media index. |
+| T2 | Artifact is downloadable (HTTP 2xx). |
+| T3 | MIME type matches the declared modality (header -> libmagic -> ext). |
+| T4 | Content hash is not a duplicate within the same site. |
+| T5 | Hallucination flag (derived from T1: URL not in source DOM -> high). |
 
-- Python 3.11 or newer
-- A clean virtual environment
-- Chromium installed through Playwright
-- Valid API credentials when using external services
+Text Gate (2 gates, both via `gate1_observed`):
+
+| Gate | Check |
+|------|-------|
+| T1 | Normalized candidate text appears verbatim in the page DOM. |
+| T2 | When T1 fails, token-set similarity against a sliding DOM window passes a fuzzy threshold. |
+
+## Repository layout
+
+```
+.
+|-- web_crawler/                    Main pipeline package (web_crawler.main)
+|   |-- main.py                     CLI entry
+|   |-- pipeline/
+|   |   |-- step1.py / step2.py
+|   |   |-- runtime.py
+|   |   |-- bfs_rules.py
+|   |   `-- verification/           5-Gate (image/video) + Text Gate (T1+T2) (text)
+|   |-- _patch_browser_use_*.py     Local patches for browser-use 0.7.0
+|   `-- verify_links_bfs_good.py    URL liveness check (HTTP + browser fallback)
+|-- scripts/
+|   |-- run_bara.py                 End-to-end BaRA orchestrator
+|   `-- eval_unified.py             P/R/Acc evaluator (image/video/text)
+|-- data/
+|   `-- seed_urls.selected.jsonl    Real-world seed URL list (50 sites)
+|-- requirements.txt
+`-- README.md
+```
 
 ## Installation
-
-Create and activate a virtual environment:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
-pip install --upgrade pip
 pip install -r requirements.txt
+python -m playwright install chromium
 ```
 
-Install the Playwright browser:
+`requirements.txt` pins the verified versions of `browser-use==0.7.0`,
+`playwright`, `yt-dlp`, `firecrawl-py`, and supporting libraries.
+
+The two patch files under `web_crawler/_patch_browser_use_*.py` are loaded at
+import time by `web_crawler.pipeline.runtime` and fix two issues in
+`browser-use==0.7.0`:
+* hardcoded per-event timeouts that fire before slow hosts become
+  interactable (overridable via `BROWSER_USE_EVENT_TIMEOUT`);
+* `top_p` / `seed` being forwarded into the OpenAI client constructor (which
+  rejects them).
+
+## Run modes
+
+The pipeline has two stages. Step 2 (extraction) flows directly into
+verification when `--enable_verification` is set, so verification is the
+follow-up gating phase of Step 2 rather than a separate run mode.
+
+| Stage | Flag(s) | What it does | Output |
+|-------|---------|--------------|--------|
+| **Step 1: link collection** | `--run_mode step1` | Playwright BFS (no LLM) | `links_bfs.json` |
+| **Step 2: extraction -> verification** | `--run_mode step2 --start_url_path links_bfs.json --enable_verification` | LLM extraction per page, then LLM-free gate filtering (image/video 5-Gate, text Gate T1+T2) | `step2_results.jsonl`, `verification_records.jsonl`, `artifacts/` |
+| **Full pipeline** | `--run_mode all --enable_verification` | Step 1 -> Step 2 (extraction -> verification) | all of the above |
+
+### 1) Full pipeline
 
 ```bash
-playwright install chromium
+export OPENROUTER_API_KEY=""   # set your OpenRouter API key here
+PYTHONPATH=. python -m web_crawler.main \
+    --first_url https://example.com/some-site \
+    --max_depth 3 --max_width 5 --max_pages 50 \
+    --llm_provider openrouter \
+    --model_name google/gemini-3-flash-preview \
+    --enable_verification \
+    --verification_output_dir ./verification_out \
+    --api_keys "$OPENROUTER_API_KEY"
 ```
 
-## Main Entry Point
+Step 2 runs single-threaded by default. Pass `--step2_concurrency N` to
+launch N concurrent LLM extraction calls per topic.
 
-Show all available arguments:
+Output (in the current working directory):
+* `links_bfs.json` -- Step 1 BFS result
+* `step2_results.jsonl` -- one line per visited page
+* `verification_out/<host>/verification_records.jsonl` -- one line per artifact
+* `verification_out/<host>/artifacts/` -- downloaded media and accepted text
+
+### 2) Step 1 only -- collect links
 
 ```bash
-python -m web_crawler.main --help
+PYTHONPATH=. python -m web_crawler.main \
+    --first_url https://example.com/some-site \
+    --max_depth 3 --max_width 5 --max_pages 50 \
+    --run_mode step1
 ```
 
-The pipeline is executed through `web_crawler.main`.
+Writes `links_bfs.json` and exits.
 
-Use `--run_mode` to choose how to run it:
-
-- `all`: run Step 1 -> Step 2 -> Step 3
-- `step1`: run only Step 1
-- `step2`: run only Step 2
-- `step3`: run only Step 3
-
-## Run the Full Pipeline
-
-Use this when you want to start from the first URL and execute everything in order.
+### 3) Step 2 (extraction -> verification) on existing links
 
 ```bash
-python -m web_crawler.main \
-  --run_mode all \
-  --llm_provider google \
-  --api_keys YOUR_API_KEY \
-  --first_url https://example.com
+PYTHONPATH=. python -m web_crawler.main \
+    --first_url https://example.com/some-site \
+    --start_url_path links_bfs.json \
+    --run_mode step2 \
+    --llm_provider openrouter \
+    --model_name google/gemini-3-flash-preview \
+    --enable_verification \
+    --verification_output_dir ./verification_out \
+    --api_keys "$OPENROUTER_API_KEY"
 ```
 
-Typical flow:
+Step 2 writes `step2_results.jsonl` (one line per visited page) and then
+runs verification on every extracted artifact. Per-artifact gate records
+land in `verification_out/<host>/verification_records.jsonl`; passing
+media / text are stored under `verification_out/<host>/artifacts/`.
 
-1. Step 1 collects links and creates `links_bfs.json`
-2. Step 2 reads collected links and extracts page content
-3. Step 3 classifies extracted content and writes results
-
-## Run Each Step Independently
-
-### Step 1 Only
-
-Use this when you only want link collection.
+### 4) Bulk runner for many URLs
 
 ```bash
-python -m web_crawler.main \
-  --run_mode step1 \
-  --llm_provider google \
-  --api_keys YOUR_API_KEY \
-  --first_url https://example.com \
-  --max_depth 1 \
-  --max_width 2 \
-  --max_pages 5 \
-  --max_attempts 2
+python scripts/run_bara.py \
+    --urls-file ./urls.txt \
+    --out ./runs/bara_demo \
+    --model google/gemini-3-flash-preview \
+    --api-key "$OPENROUTER_API_KEY"
 ```
 
-Expected output:
+By default each topic runs sequentially with Step 2 concurrency 1. Use
+`--parallel N` to launch N topics in parallel and `--concurrency M` to
+allow M concurrent LLM calls inside each topic. `--timeout-s` (default
+1800) sets the per-topic timeout.
 
-- `links_bfs.json`
+## Output layout
 
-### Step 2 Only
+A full pipeline run on a single start URL produces the following tree in
+the working directory (the `<host_slug>` folder is named after the start
+URL with non-word characters replaced by `_`):
 
-Use this when you already have a `links_bfs.json` file from Step 1.
+```
+./
+|-- links_bfs.json                          # Step 1: visited_order + by_depth
+|-- step2_results.jsonl                     # Step 2: one JSON line per page
+|-- annotations/                            # LLM-free per-page ground truth (default ON)
+|   `-- page_<N>.json                       # image/video/link/text counts + lists + text_full
+|-- run.log                                 # combined stdout/stderr
+`-- verification_out/
+    `-- <host_slug>/
+        |-- verification_records.jsonl      # one JSON line per artifact (gates + decision)
+        |-- verification_summary.json       # site-level totals (by_type counts)
+        |-- dom_dump/                       # rendered HTML per page (used by T1 / text gates)
+        |   `-- page_<N>.html
+        |-- network_dump/                   # per-page HTTP metadata captured during extraction
+        |   `-- page_<N>.json
+        `-- artifacts/                      # ONLY artifacts that passed verification
+            |-- images/<hash>.{jpg,png,webp,...}
+            |-- videos/<hash>.{mp4,webm,...}
+            `-- texts/
+                `-- included_texts.jsonl    # full text bodies that passed T1/T2
+```
+
+`annotations/` is produced by an LLM-free Playwright pass that records what
+the page actually contains (images, videos, links, full text). It is the
+ground-truth side used by `scripts/eval_unified.py`. Disable it with
+`--no_annotation` if you only want the predictive outputs.
+
+The bulk runner (`scripts/run_bara.py`) creates one such tree per URL
+under `--out`:
+
+```
+./runs/bara_demo/
+|-- web_<slug_1>/
+|   |-- links_bfs.json
+|   |-- step2_results.jsonl
+|   |-- run.log
+|   `-- verification_out/<host_slug>/...
+|-- web_<slug_2>/...
+`-- ...
+```
+
+### File-by-file
+
+| File | Shape |
+|------|-------|
+| `links_bfs.json` | `{start_url, max_depth, max_width, max_pages, visited_order: [url], by_depth: {0: [url], 1: [url], ...}, dead_links: [url]}` |
+| `step2_results.jsonl` | One JSON object per line: `{sub_url, page_index, last_extracted_content: {content, ...}}` -- `content` carries `Text(s)`, `Image(s)`, `Video(s)` sections |
+| `annotations/page_<N>.json` | `{image_count, images: [url], video_count, videos: [url], link_count, links: [{text, href}], text_length, text_full}` |
+| `verification_records.jsonl` | One JSON object per artifact: `{artifact_url, artifact_type, source_page, page_index, gate1_observed, gate2_download_ok, gate3_mime_ok, gate4_not_duplicate, gate5_not_hallucinated, file_hash, mime_type, text_similarity (text only), text_content (text only), final_decision, exclusion_reasons, verified_at, duration_ms}` |
+| `verification_summary.json` | `{total_candidates, by_type: {image: {included, excluded, ...}, video: {...}, text: {...}}}` |
+| `artifacts/texts/included_texts.jsonl` | One JSON per accepted text: `{candidate_id, text, source_page, page_index, char_count, word_count, observation_channel, text_similarity, verified_at}` |
+
+## Real-world seed list
+
+`data/seed_urls.selected.jsonl` is the 50-site seed list used for the
+real-world experiments (one JSON object per line). Each entry exposes the
+URL plus its source provenance (`tranco`, `hn_algolia`, `wikipedia`,
+`curlie`), language detection, body length, depth-2 media counts, and topic
+cluster id.
+
+Extract the URLs into a plain text file consumable by `scripts/run_bara.py`:
 
 ```bash
-python -m web_crawler.main \
-  --run_mode step2 \
-  --llm_provider google \
-  --api_keys YOUR_API_KEY \
-  --start_url_path links_bfs.json \
-  --step2_results_file step2_results.jsonl \
-  --max_attempts 2 \
-  --step2_union_retry_attempts 2
+python -c "import json; \
+[print(json.loads(l)['url']) for l in open('data/seed_urls.selected.jsonl')]" \
+    > realworld_urls.txt
+
+python scripts/run_bara.py \
+    --urls-file realworld_urls.txt \
+    --out ./runs/bara_realworld \
+    --model google/gemini-3-flash-preview \
+    --api-key "$OPENROUTER_API_KEY"
 ```
-
-Expected input:
-
-- `links_bfs.json`
-
-Expected output:
-
-- `step2_results.jsonl`
-
-### Step 3 Only
-
-Use this when you already have Step 2 output.
-
-```bash
-python -m web_crawler.main \
-  --run_mode step3 \
-  --llm_provider google \
-  --api_keys YOUR_API_KEY \
-  --step2_results_file step2_results.jsonl \
-  --step3_batch_size 50 \
-  --step3_batch_retries 2
-```
-
-Expected input:
-
-- `step2_results.jsonl`
-
-Expected output:
-
-- `json_page/page_*/legal_content.json`
-- `json_page/page_*/illegal_content.json`
-- classified text, image, and video outputs under the generated root directory
-
-## Common Arguments
-
-### Provider and model
-
-- `--llm_provider {google,ollama}`
-- `--api_keys`
-- `--model_name`
-- `--ollama_host`
-- `--ollama_api_key`
-
-### Target and filtering
-
-- `--first_url`
-- `--wanted`
-- `--wanted_file`
-
-### Step 1 controls
-
-- `--max_depth`
-- `--max_width`
-- `--max_pages`
-- `--max_attempts`
-- `--step1_only`
-- `--skip_step1_prefix`
-- `--step1_links_path`
-
-### Step 2 controls
-
-- `--start_url_path`
-- `--step2_results_file`
-- `--step2_union_retry_attempts`
-
-### Step 3 controls
-
-- `--step3_batch_size`
-- `--step3_batch_retries`
 
 ## Evaluation
 
-Show all available arguments:
+`scripts/eval_unified.py` computes:
+
+* Step 1 (sub-link discovery): MICRO and MACRO P/R/F1 over all topics.
+* Step 2 (data collection): per-page Precision, Recall, and Accuracy for
+  image, video, and text modalities, with policies:
+    - URL normalization (scheme/host lowercase, fragments and queries stripped,
+      `/index.html` and trailing `/` removed).
+    - Text normalized to a word set (lowercase + punctuation/whitespace).
+    - None=exclude: pages where both pred and GT are empty for a modality
+      are skipped.
+    - GT pages flagged as error/404 are excluded entirely.
+    - **Pred-side dead-page text=0**: if the pred page's joined text triggers
+      the error-page heuristic, that page's text P/R/Acc are forced to 0.
+      Image/video are unaffected (404 pages typically have no media URLs).
+    - Missing pred page (URL mismatch) -> all modalities P=R=Acc=0.
+
+GT layout expected:
+
+```
+gt_annotation/<topic>/page_N.json    # one JSON per page with
+                                     # image_count, images[], video_count,
+                                     # videos[], link_count, links[],
+                                     # text_length, text_full
+gt_links/web_<topic>/links_bfs.json  # visited_order + by_depth
+```
+
+Example:
 
 ```bash
-python -m web_crawler.eval --help
+python scripts/eval_unified.py \
+    --run ./runs/bara_demo \
+    --type bara \
+    --gt-annotation ./data/gt_annotation \
+    --gt-links      ./data/gt_links \
+    --label bara_demo \
+    --out-json ./eval_bara_demo.json
 ```
 
-The evaluation script expects a data root with this structure:
+Set `--type baseline` for a browser-use-style run (`json_page/page_N/data.json`
+layout). Add `--no-pred-dead-text-zero` to disable the dead-page text=0
+policy.
 
-```text
-<data_root>/
-├── annotations/
-├── json_page/
-├── legal/
-└── illegal/
-```
+## URL liveness verification
 
-Run evaluation:
+`web_crawler.verify_links_bfs_good` checks URLs in `links_bfs.json` files with
+a two-tier strategy: a cheap HTTP probe first, then a real headless Chromium
+fallback for sites that WAF out a bare `requests` (genuine TLS fingerprint,
+full headers, JS challenge resolution). The browser verdict wins, so
+bot-protected sites that BaRA legitimately reached are not falsely marked
+dead. The output file aggregates per-file `total` / `alive` counts plus a
+`grand_total` / `grand_alive`, which is what the Step 1 micro/macro link
+metrics consume.
 
 ```bash
-python -m web_crawler.eval --data_root /path/to/data_root
+# single file
+python -m web_crawler.verify_links_bfs_good path/to/links_bfs.json --output report.json
+
+# folder (recursively finds every links_bfs.json under it)
+python -m web_crawler.verify_links_bfs_good ./runs/bara_demo --output report.json
+
+# HTTP-only (skip the browser tier)
+python -m web_crawler.verify_links_bfs_good ./runs/bara_demo --no-browser-fallback
 ```
-
-Run evaluation with detailed per-page output:
-
-```bash
-python -m web_crawler.eval \
-  --data_root /path/to/data_root \
-  --show_details
-```
-
-Run evaluation with line-based text comparison:
-
-```bash
-python -m web_crawler.eval \
-  --data_root /path/to/data_root \
-  --text_metric_unit line
-```
-
-## Notes
-
-- The crawler uses [browser-use](https://github.com/browser-use/browser-use).
-- Browser-based execution requires `playwright install chromium`.
-- External credentials should be passed through arguments or environment variables.
-- Step 2 and Step 3 can be executed independently only when their required input files already exist.

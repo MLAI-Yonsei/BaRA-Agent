@@ -1,7 +1,11 @@
 import asyncio
 from dotenv import load_dotenv
+
+import web_crawler._patch_browser_use_openrouter  # noqa: F401 — before AsyncOpenAI client init
+import web_crawler._patch_browser_use_navigation_timeout  # noqa: F401 — bump 15s nav cap
+
 from browser_use import Agent, BrowserProfile
-from browser_use.llm import ChatGoogle, ChatOllama
+from browser_use.llm import ChatGoogle, ChatOllama, ChatOpenRouter
 from browser_use.llm.messages import UserMessage
 import os
 import json
@@ -26,23 +30,27 @@ os.environ["BUBUS_MAX_HISTORY_SIZE"] = "1000"
 os.environ["BUBUS_AUTO_CLEAR"] = "true"
 interrupted = False
 
-def create_llm(provider: str, model_name: str, api_key: Optional[str] = None, 
+def create_llm(provider: str, model_name: str, api_key: Optional[str] = None,
                temperature: float = 0.3, top_p: float = 0.8, seed: Optional[int] = 42,
-               ollama_host: Optional[str] = None, ollama_api_key: Optional[str] = None):
+               ollama_host: Optional[str] = None, ollama_api_key: Optional[str] = None,
+               openrouter_base_url: Optional[str] = None,
+               openrouter_http_referer: Optional[str] = None):
     """Create an LLM instance for the selected provider.
-    
+
     Args:
-        provider: ``google`` or ``ollama``
+        provider: ``google``, ``ollama``, or ``openrouter``
         model_name: model identifier to use
-        api_key: Google API key when required
+        api_key: API key for cloud providers (Google or OpenRouter)
         temperature: generation temperature
         top_p: top-p sampling value
         seed: seed value for providers that support it
         ollama_host: Ollama server host URL
         ollama_api_key: optional API key for remote Ollama-backed models
-        
+        openrouter_base_url: optional override for the OpenRouter API base URL
+        openrouter_http_referer: optional HTTP-Referer header for OpenRouter request attribution
+
     Returns:
-        ChatGoogle or ChatOllama instance
+        ChatGoogle, ChatOllama, or ChatOpenRouter instance
     """
     if provider.lower() == "google":
         return ChatGoogle(
@@ -60,14 +68,39 @@ def create_llm(provider: str, model_name: str, api_key: Optional[str] = None,
         # gemini_api_key = ollama_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         # if gemini_api_key and not os.getenv("GEMINI_API_KEY"):
         #     os.environ["GEMINI_API_KEY"] = gemini_api_key
-        
+
         return ChatOllama(
             model=model_name,
             host=host,
             timeout=240.0
         )
+    elif provider.lower() == "openrouter":
+        resolved_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        if not resolved_key:
+            raise ValueError(
+                "OpenRouter provider requires an API key. Pass it via --api_keys "
+                "or set the OPENROUTER_API_KEY environment variable."
+            )
+        # OpenRouter routes to many backend models; not all support `seed`
+        # (Anthropic, Google, some Meta providers reject it with 400). Drop it
+        # rather than gambling on the model.
+        kwargs = {
+            "model": model_name,
+            "temperature": temperature,
+            "top_p": top_p,
+            "api_key": resolved_key,
+        }
+        base_url = openrouter_base_url or os.getenv("OPENROUTER_BASE_URL")
+        if base_url:
+            kwargs["base_url"] = base_url
+        referer = openrouter_http_referer or os.getenv("OPENROUTER_HTTP_REFERER")
+        if referer:
+            kwargs["http_referer"] = referer
+        return ChatOpenRouter(**kwargs)
     else:
-        raise ValueError(f"Unsupported provider: {provider}. Use 'google' or 'ollama'.")
+        raise ValueError(
+            f"Unsupported provider: {provider}. Use 'google', 'ollama', or 'openrouter'."
+        )
 
 
 def signal_handler(signum, frame):
@@ -77,6 +110,7 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 FEEDBACK_HISTORY_FILE = "feedback_history.json"
+_DOWNLOAD_VERIFY_ENABLED: bool = True
 
 
 def is_url_downloadable(url, timeout=5):
@@ -621,7 +655,7 @@ def is_video(url: str):
     return False
 def download_image(url, save_path):
     """Download and save an image.
-    
+
     Returns:
         bool: ``True`` on success, otherwise ``False``
     """
@@ -633,35 +667,43 @@ def download_image(url, save_path):
         if not url.startswith(('http://', 'https://')):
             print(f"❌ Invalid URL format: {url}")
             return False
-        
+
         r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            path_part = url.lower().split("?")[0].split("#")[0]
-            if path_part.endswith(".svg"):
-                save_path_svg = os.path.splitext(save_path)[0] + ".svg"
-                with open(save_path_svg, "wb") as f:
-                    f.write(r.content)
-                print(f"📷 Saved image (SVG): {save_path_svg}")
-                return True
-            img = Image.open(io.BytesIO(r.content))
-            if img.mode in ('RGBA', 'LA', 'P'):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode == 'P':
-                    img = img.convert('RGBA')
-                background.paste(
-                    img,
-                    mask=img.split()[-1] if img.mode in ('RGBA',
-                                                         'LA') else None)
-                img = background
-            elif img.mode != 'RGB':
-                img = img.convert('RGB')
-            save_path_jpg = os.path.splitext(save_path)[0] + '.jpg'
-            img.save(save_path_jpg, 'JPEG', quality=95)
-            print(f"📷 Saved image: {save_path_jpg}")
-            return True
-        else:
+        if r.status_code != 200:
             print(f"❌ Image download failed: {url} (status code: {r.status_code})")
             return False
+
+        if not _DOWNLOAD_VERIFY_ENABLED:
+            save_path_jpg = os.path.splitext(save_path)[0] + '.jpg'
+            os.makedirs(os.path.dirname(save_path_jpg), exist_ok=True)
+            with open(save_path_jpg, 'wb') as f:
+                f.write(r.content)
+            print(f"📷 [no_download_verify] Saved raw image bytes: {save_path_jpg}")
+            return True
+
+        path_part = url.lower().split("?")[0].split("#")[0]
+        if path_part.endswith(".svg"):
+            save_path_svg = os.path.splitext(save_path)[0] + ".svg"
+            with open(save_path_svg, "wb") as f:
+                f.write(r.content)
+            print(f"📷 Saved image (SVG): {save_path_svg}")
+            return True
+        img = Image.open(io.BytesIO(r.content))
+        if img.mode in ('RGBA', 'LA', 'P'):
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(
+                img,
+                mask=img.split()[-1] if img.mode in ('RGBA',
+                                                     'LA') else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        save_path_jpg = os.path.splitext(save_path)[0] + '.jpg'
+        img.save(save_path_jpg, 'JPEG', quality=95)
+        print(f"📷 Saved image: {save_path_jpg}")
+        return True
     except Exception as e:
         print(f"❌ Image error: {e}")
         return False
@@ -669,7 +711,7 @@ def download_image(url, save_path):
 
 def download_video(url, save_path):
     """Download and save a video.
-    
+
     Returns:
         bool: ``True`` on success, otherwise ``False``
     """
@@ -678,9 +720,29 @@ def download_video(url, save_path):
         if not url.startswith(('http://', 'https://')):
             print(f"❌ Invalid video URL format: {url}")
             return False
+
+        if not _DOWNLOAD_VERIFY_ENABLED:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Referer': 'https://example.com/'
+            }
+            try:
+                response = requests.get(url, headers=headers, stream=True, timeout=30)
+                response.raise_for_status()
+                with open(save_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                print(f"✅ [no_download_verify] Video saved via requests only: {save_path}")
+                return True
+            except Exception as e:
+                print(f"❌ [no_download_verify] Direct download failed (no yt_dlp fallback): {url} | {e}")
+                return False
+
         url_lower = url.lower()
         is_direct_mp4 = url_lower.endswith('.mp4') or '.mp4?' in url_lower or '/mp4/' in url_lower
-        
+
         if is_direct_mp4:
             print(f"📥 Direct MP4 link detected, downloading with requests: {url[:100]}...")
             try:
@@ -704,7 +766,7 @@ def download_video(url, save_path):
                                 percent = (downloaded / total_size) * 100
                                 if downloaded % (1024 * 1024) == 0:
                                     print(f"📥 Download progress: {downloaded / (1024*1024):.2f} MB / {total_size / (1024*1024):.2f} MB ({percent:.1f}%)")
-                
+
                 print(f"✅ Video saved: {save_path} ({downloaded / (1024*1024):.2f} MB)")
                 return True
             except requests.exceptions.RequestException as e:
@@ -1372,6 +1434,377 @@ async def evaluate_success_with_gemini(llm, original_task, evaluation_data):
         return False, f"Error: {e}", ""
 
 
+def _try_extract_anchors(text: str) -> Optional[List[str]]:
+    """Pull a list of anchor strings out of a worker LLM response."""
+    if not text:
+        return None
+    s = text.strip()
+    if s.startswith("```"):
+        nl = s.find("\n")
+        if nl != -1:
+            s = s[nl + 1:]
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3].rstrip()
+    idx = s.find("{")
+    if idx == -1:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        obj, _ = decoder.raw_decode(s[idx:])
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    anchors = obj.get("anchors")
+    if not isinstance(anchors, list):
+        return None
+    return [a for a in anchors if isinstance(a, str)]
+
+
+def _parse_anchors_from_window(history, history_index_floor: int) -> List[str]:
+    """Search this run's new extracted_content (after history_index_floor) for an anchor list."""
+    contents = [
+        c for c in collect_extracted_content(history)
+        if c.get("history_index", -1) >= history_index_floor
+    ]
+    for c in reversed(contents):
+        anchors = _try_extract_anchors(c.get("content") or "")
+        if anchors is not None:
+            return anchors
+    return []
+
+
+async def _run_step1_rule_bfs(
+    first_url: str,
+    api_key: Optional[str],
+    model_name: str,
+    max_depth: int,
+    max_width: int,
+    max_pages: int,
+    llm_provider: str = "google",
+    ollama_host: Optional[str] = None,
+    ollama_api_key: Optional[str] = None,
+):
+    """Rule BFS: Python orchestrator drives the queue, LLM extracts anchors per page.
+
+    A fresh browser-use Agent is launched per URL so each call benefits from the
+    constructor's automatic go_to_url initial-action injection. Filtering /
+    normalization / dedup / max_width / max_depth / max_pages all live in code
+    (web_crawler.pipeline.bfs_rules).
+    """
+    from collections import deque
+    from web_crawler.pipeline.bfs_rules import normalize, filter_children
+    from ablation.prompts.general_prompt import GENERAL_WORKER_TEMPLATE
+
+    start_url = normalize(first_url) or first_url
+
+    llm = create_llm(
+        provider=llm_provider,
+        model_name=model_name,
+        api_key=api_key,
+        temperature=0.2,
+        top_p=1.0,
+        seed=42,
+        ollama_host=ollama_host,
+        ollama_api_key=ollama_api_key,
+    )
+
+    if llm_provider.lower() in ("google", "openrouter"):
+        llm_timeout_val, step_timeout_val, per_page_timeout = 240, 300, 240
+    else:
+        llm_timeout_val, step_timeout_val, per_page_timeout = 240, 360, 300
+
+    queue = deque([(start_url, 0)])
+    visited_order: List[str] = []
+    # by_depth captures every URL we have *committed to the result* — that
+    # includes URLs we actually fetched AND URLs that were enqueued but
+    # never visited (the queue tail when max_pages caps the BFS). Step 2
+    # reads from by_depth, so this is what controls how much downstream
+    # work happens. max_pages is the cap on this total.
+    by_depth: Dict[str, List[str]] = {"0": [start_url]}
+    visited_set = set()
+    # URLs that have entered the queue OR been visited. Tracks the
+    # "committed" set; also passed to filter_children so a shared nav
+    # menu does not eat the width budget on every page.
+    seen_set = {start_url}
+    last_history = None
+
+    # Loop while there is work to do AND we have not yet reached the
+    # by_depth size cap (max_pages). The cap is checked both here (to
+    # avoid one extra LLM call once full) and inside the enqueue loop.
+    while queue and len(seen_set) < max_pages:
+        url, depth = queue.popleft()
+        if url in visited_set or depth > max_depth:
+            continue
+        visited_set.add(url)
+        visited_order.append(url)
+
+        print(f"[Rule BFS] visit #{len(visited_order)} (by_depth={len(seen_set)}/{max_pages}) "
+              f"depth={depth} {url}")
+
+        temp_dir = tempfile.mkdtemp(prefix="browseruse-step1-rule-")
+        agent = Agent(
+            task=GENERAL_WORKER_TEMPLATE.format(url=url),
+            llm=llm,
+            browser_profile=BrowserProfile(
+                headless=True,
+                devtools=False,
+                user_data_dir=temp_dir,
+                disable_security=True,
+                extra_chromium_args=[
+                    '--disable-dev-shm-usage', '--no-sandbox', '--disable-extensions'],
+            ),
+            max_actions_per_step=1,
+            llm_timeout=llm_timeout_val,
+            step_timeout=step_timeout_val,
+        )
+
+        try:
+            try:
+                history = await asyncio.wait_for(
+                    agent.run(max_steps=5), timeout=per_page_timeout)
+                last_history = history
+            except asyncio.TimeoutError:
+                print(f"[Rule BFS] ⏰ per-page timeout on {url} — skipping children")
+                continue
+            except Exception as e:
+                print(f"[Rule BFS] ❌ agent.run failed on {url}: {e}")
+                continue
+
+            anchors = _parse_anchors_from_window(history, 0)
+            children, _dead = filter_children(
+                anchors, parent_url=url, start_url=start_url,
+                max_width=max_width, already_seen=seen_set)
+
+            added = 0
+            cap_hit = False
+            if depth + 1 <= max_depth:
+                for c in children:
+                    if c in seen_set:
+                        continue
+                    if len(seen_set) >= max_pages:
+                        cap_hit = True
+                        break
+                    queue.append((c, depth + 1))
+                    seen_set.add(c)
+                    by_depth.setdefault(str(depth + 1), []).append(c)
+                    added += 1
+            tag = "  ⛔ max_pages cap" if cap_hit else ""
+            print(f"[Rule BFS]   ↳ {len(anchors)} anchors → {len(children)} new → "
+                  f"{added} enqueued{tag}")
+        finally:
+            try:
+                agent.stop()
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    if not visited_order:
+        print("[Rule BFS] ❌ no pages visited successfully")
+        return None
+
+    output = {
+        "start_url": start_url,
+        "max_depth": max_depth,
+        "max_width": max_width,
+        "max_pages": max_pages,
+        "visited_order": visited_order,
+        "by_depth": by_depth,
+        "dead_links": [],
+    }
+    with open("links_bfs.json", "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    total_urls = sum(len(v) for v in by_depth.values())
+    print(f"[Rule BFS] ✅ wrote links_bfs.json — {total_urls} URLs in by_depth "
+          f"(max_pages={max_pages}), {len(visited_order)} LLM-fetched, "
+          f"max_depth_reached={max(int(k) for k in by_depth)}")
+    return last_history, "links_bfs.json"
+
+
+_BFS_LINK_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _resolve_bfs_link(url: str):
+    """Liveness probe for a BFS child candidate.
+
+    Returns ``(alive, final_url)``. Redirects are followed so a 3xx lands on
+    its canonical target. Only 404/410 count as dead; transient or ambiguous
+    outcomes (5xx, timeout, connection error) are treated as alive so a flaky
+    probe never silently removes a real link.
+    """
+    try:
+        r = requests.get(
+            url, timeout=15, allow_redirects=True, stream=True,
+            headers={"User-Agent": _BFS_LINK_UA, "Accept": "*/*"},
+        )
+        status, final_url = r.status_code, r.url
+        r.close()
+    except requests.exceptions.RequestException:
+        return True, url
+    if status in (404, 410):
+        return False, url
+    return True, final_url
+
+
+async def _run_step1_playwright_bfs(
+    first_url: str,
+    max_depth: int,
+    max_width: int,
+    max_pages: int,
+):
+    """Deterministic BFS: Playwright drives the queue AND extracts anchors.
+
+    No LLM, no browser-use Agent. Anchors are pulled straight off the rendered
+    DOM via ``document.querySelectorAll('a[href]')``, so the same page in the
+    same state always yields the same anchor set. Filtering / normalization /
+    dedup / max_width / max_depth / max_pages all live in
+    web_crawler.pipeline.bfs_rules — identical to the LLM Rule BFS path, only
+    the anchor-extraction step differs.
+    """
+    from collections import deque
+    from web_crawler.pipeline.bfs_rules import normalize, filter_children
+
+    start_url = normalize(first_url) or first_url
+
+    queue = deque([(start_url, 0)])
+    visited_order: List[str] = []
+    by_depth: Dict[str, List[str]] = {"0": [start_url]}
+    visited_set = set()
+    seen_set = {start_url}
+    dead_links: set = set()
+
+    # networkidle is a best-effort wait — script-heavy sites may never go idle,
+    # so cap it short and fall back to a plain 'load' wait with a longer budget.
+    networkidle_timeout_ms = 15000
+    load_timeout_ms = 45000
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--disable-dev-shm-usage', '--no-sandbox',
+                  '--disable-extensions'],
+        )
+        try:
+            while queue and len(seen_set) < max_pages:
+                url, depth = queue.popleft()
+                if url in visited_set or depth > max_depth:
+                    continue
+                visited_set.add(url)
+                visited_order.append(url)
+
+                print(f"[Playwright BFS] visit #{len(visited_order)} "
+                      f"(by_depth={len(seen_set)}/{max_pages}) depth={depth} {url}")
+
+                context = await browser.new_context()
+                page = await context.new_page()
+                anchors: List[str] = []
+                try:
+                    try:
+                        response = await page.goto(url, wait_until="networkidle",
+                                                   timeout=networkidle_timeout_ms)
+                    except Exception as e:
+                        # networkidle can time out on pages holding long-poll /
+                        # streaming sockets open — retry with a plain load wait
+                        # before giving up on the page.
+                        print(f"[Playwright BFS] ⚠️ networkidle failed on {url}: "
+                              f"{e} — retrying with 'load'")
+                        try:
+                            response = await page.goto(url, wait_until="load",
+                                                       timeout=load_timeout_ms)
+                        except Exception as e2:
+                            print(f"[Playwright BFS] ❌ goto failed on {url}: "
+                                  f"{e2} — skipping children")
+                            continue
+
+                    # An error page (4xx/5xx) still renders a DOM, but its <a>
+                    # nodes are error-template noise (global nav, language
+                    # switcher) — not real child links. Skip child extraction
+                    # so the BFS tree isn't polluted with them.
+                    status = response.status if response is not None else 0
+                    if status >= 400:
+                        print(f"[Playwright BFS] ⚠️ {url} returned HTTP {status} "
+                              f"— skipping children")
+                        continue
+
+                    # Nudge lazy-loaded anchors into the DOM: scroll once and
+                    # give late JS a brief window to attach more <a> nodes.
+                    try:
+                        await page.evaluate(
+                            "window.scrollTo(0, document.body.scrollHeight)")
+                        await page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+
+                    try:
+                        anchors = await page.eval_on_selector_all(
+                            "a[href]", "els => els.map(a => a.href)")
+                    except Exception as e:
+                        print(f"[Playwright BFS] ❌ anchor extraction failed on "
+                              f"{url}: {e} — skipping children")
+                        continue
+                finally:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+
+                children, dead = filter_children(
+                    anchors, parent_url=url, start_url=start_url,
+                    max_width=max_width, already_seen=seen_set,
+                    resolve=_resolve_bfs_link)
+                dead_links.update(dead)
+
+                added = 0
+                cap_hit = False
+                if depth + 1 <= max_depth:
+                    for c in children:
+                        if c in seen_set:
+                            continue
+                        if len(seen_set) >= max_pages:
+                            cap_hit = True
+                            break
+                        queue.append((c, depth + 1))
+                        seen_set.add(c)
+                        by_depth.setdefault(str(depth + 1), []).append(c)
+                        added += 1
+                tag = "  ⛔ max_pages cap" if cap_hit else ""
+                print(f"[Playwright BFS]   ↳ {len(anchors)} anchors → "
+                      f"{len(children)} new → {added} enqueued{tag}")
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    if not visited_order:
+        print("[Playwright BFS] ❌ no pages visited successfully")
+        return None
+
+    output = {
+        "start_url": start_url,
+        "max_depth": max_depth,
+        "max_width": max_width,
+        "max_pages": max_pages,
+        "visited_order": visited_order,
+        "by_depth": by_depth,
+        "dead_links": sorted(dead_links),
+    }
+    with open("links_bfs.json", "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    total_urls = sum(len(v) for v in by_depth.values())
+    print(f"[Playwright BFS] ✅ wrote links_bfs.json — {total_urls} URLs in "
+          f"by_depth (max_pages={max_pages}), {len(visited_order)} pages "
+          f"fetched, {len(dead_links)} dead links excluded, "
+          f"max_depth_reached={max(int(k) for k in by_depth)}")
+    return None, "links_bfs.json"
+
+
 async def run_step1(wanted,
                     first_url,
                     api_key,
@@ -1382,8 +1815,64 @@ async def run_step1(wanted,
                     max_attempts: int = 10,
                     llm_provider: str = "google",
                     ollama_host: Optional[str] = None,
-                    ollama_api_key: Optional[str] = None):
-    original_task = f"""                
+                    ollama_api_key: Optional[str] = None,
+                    ablation_no_bfs: bool = False,
+                    ablation_prompt_bfs: bool = False,
+                    ablation_llm_bfs: bool = False,
+                    ablation_no_reflection: bool = False):
+    # New default: deterministic Playwright BFS (no LLM — anchors pulled
+    # straight off the rendered DOM). The opt-in modes keep the older paths:
+    #   --ablation_llm_bfs    → code-driven BFS + LLM per-page anchor worker
+    #   --ablation_no_bfs     → legacy autonomous prompt
+    #   --ablation_prompt_bfs → legacy inline BFS prompt
+    if not (ablation_no_bfs or ablation_prompt_bfs or ablation_llm_bfs):
+        return await _run_step1_playwright_bfs(
+            first_url=first_url,
+            max_depth=max_depth,
+            max_width=max_width,
+            max_pages=max_pages,
+        )
+
+    if ablation_llm_bfs:
+        return await _run_step1_rule_bfs(
+            first_url=first_url,
+            api_key=api_key,
+            model_name=model_name,
+            max_depth=max_depth,
+            max_width=max_width,
+            max_pages=max_pages,
+            llm_provider=llm_provider,
+            ollama_host=ollama_host,
+            ollama_api_key=ollama_api_key,
+        )
+
+    if ablation_no_bfs:
+        # Legacy autonomous prompt (preserved verbatim — pending design refresh).
+        original_task = f"""
+You are a web crawler. Visit the given site and collect internal links.
+
+[Start URL] {first_url}
+[Limits] max_depth = {max_depth}, max_width = {max_width}, max_pages = {max_pages}, output_path = links_bfs.json
+
+[Task]
+Browse the site and gather URLs that belong to the same registrable domain (or its
+subdomains) as the Start URL. Exclude common boilerplate paths such as /privacy, /terms,
+/login, /signup, and direct binary file links (.pdf, .zip, .rar, .7z, .apk, .dmg, .exe).
+Stop after visiting at most max_pages pages.
+
+[Output]
+Return ONLY this JSON and also save the SAME JSON to [links_bfs.json]:
+{{
+  "start_url": "{first_url}",
+  "max_depth": {max_depth},
+  "max_width": {max_width},
+  "max_pages": {max_pages},
+  "visited_order": [...],
+  "by_depth": {{"0": ["{first_url}"], "1": [...], ...}}
+}}
+"""
+    else:  # ablation_prompt_bfs — legacy BFS prompt, now an ablation comparator
+        original_task = f"""
                 You are a precise but lightweight BFS crawler that collects only internal links.
 
                 [Start URL] {first_url}
@@ -1431,13 +1920,15 @@ async def run_step1(wanted,
         ollama_api_key=ollama_api_key
     )
     current_task = original_task
+    if ablation_no_reflection:
+        max_attempts = 1
     for attempt in range(1, max_attempts + 1):
         agent = None
         try:
             print(f"[{attempt}/{max_attempts}] Attempting...")
             import tempfile
             temp_dir = tempfile.mkdtemp(prefix="browseruse-step1-")
-            if llm_provider.lower() == "google":
+            if llm_provider.lower() in ("google", "openrouter"):
                 llm_timeout_val = 240
                 step_timeout_val = 300
             else:  # ollama
@@ -1459,10 +1950,10 @@ async def run_step1(wanted,
                 llm_timeout=llm_timeout_val,
                 step_timeout=step_timeout_val,
             )
-            if llm_provider.lower() == "google":
-                total_timeout = 1600
+            if llm_provider.lower() in ("google", "openrouter"):
+                total_timeout = 2400
             else:  # ollama
-                total_timeout = 2000
+                total_timeout = 2800
             
             try:
                 history = await asyncio.wait_for(agent.run(), timeout=total_timeout)
@@ -1493,14 +1984,19 @@ async def run_step1(wanted,
             else:
                 print("No extracted content found; treating it as empty data")
                 evaluation_data = []
-            print("\nGemini is evaluating success/failure...")
-            is_successful, reason, data_summary = await evaluate_success_with_gemini(
-                llm, original_task, evaluation_data)
-
-            print(f"\nGemini judgment result:")
-            print(f"Success: {'Success' if is_successful else 'Failure'}")
-            print(f"Reason: {reason}")
-            print(f"Data summary: {data_summary}")
+            if ablation_no_reflection:
+                is_successful = bool(last_extracted_content)
+                reason = "ablation_no_reflection: treating non-empty extract as success"
+                data_summary = ""
+                print(f"\n[ablation_no_reflection] Treating result as: {'Success' if is_successful else 'Failure'}")
+            else:
+                print("\nGemini is evaluating success/failure...")
+                is_successful, reason, data_summary = await evaluate_success_with_gemini(
+                    llm, original_task, evaluation_data)
+                print(f"\nGemini judgment result:")
+                print(f"Success: {'Success' if is_successful else 'Failure'}")
+                print(f"Reason: {reason}")
+                print(f"Data summary: {data_summary}")
 
             if is_successful:
                 print("Success")
@@ -1541,36 +2037,39 @@ async def run_step1(wanted,
                 
                 return history, attachment_path
             else:
-                analysis_prompt = get_failure_analysis_prompt(
-                    original_task, long_term_memories, attempt)
-                feedback = await get_feedback_from_gemini(llm, analysis_prompt)
-
-                if feedback:
-                    print(f"\nGemini feedback:")
-                    print(feedback)
-                    parsed_feedback = parse_gemini_feedback(feedback)
-                    if parsed_feedback:
-                        print(f"\n🔍 Parsed feedback:")
-                        print(
-                            f"Failure type: {parsed_feedback.get('failure_type', 'Unknown')}"
-                        )
-                        print(
-                            f"Improvements: {parsed_feedback.get('improvements', [])}"
-                        )
-                        improved_prompt = parsed_feedback.get(
-                            'improved_prompt', current_task)
-                        if improved_prompt != current_task:
-                            print(f"\nPrompt improved!")
-                            current_task = improved_prompt
-                        save_feedback_history(attempt, original_task,
-                                              long_term_memories, feedback,
-                                              improved_prompt)
-                    else:
-                        print("Feedback parsing failed")
+                if ablation_no_reflection:
+                    print("[ablation_no_reflection] Skipping failure analysis and feedback loop.")
                 else:
-                    print("Gemini feedback request failed")
+                    analysis_prompt = get_failure_analysis_prompt(
+                        original_task, long_term_memories, attempt)
+                    feedback = await get_feedback_from_gemini(llm, analysis_prompt)
 
-                print(f"\nUsing the improved prompt for the next attempt...")
+                    if feedback:
+                        print(f"\nGemini feedback:")
+                        print(feedback)
+                        parsed_feedback = parse_gemini_feedback(feedback)
+                        if parsed_feedback:
+                            print(f"\n🔍 Parsed feedback:")
+                            print(
+                                f"Failure type: {parsed_feedback.get('failure_type', 'Unknown')}"
+                            )
+                            print(
+                                f"Improvements: {parsed_feedback.get('improvements', [])}"
+                            )
+                            improved_prompt = parsed_feedback.get(
+                                'improved_prompt', current_task)
+                            if improved_prompt != current_task:
+                                print(f"\nPrompt improved!")
+                                current_task = improved_prompt
+                            save_feedback_history(attempt, original_task,
+                                                  long_term_memories, feedback,
+                                                  improved_prompt)
+                        else:
+                            print("Feedback parsing failed")
+                    else:
+                        print("Gemini feedback request failed")
+
+                    print(f"\nUsing the improved prompt for the next attempt...")
         except Exception as e:
             print(f"❌ Error occurred: {e}, retrying...")
         finally:
@@ -1589,16 +2088,21 @@ async def run_step1(wanted,
     return None
 
 
-async def process_single_sub_url(sub_url, wanted, api_key, model_name, max_attempts, 
-                                  first_url, firecrawl_api_key, llm_provider, 
+async def process_single_sub_url(sub_url, wanted, api_key, model_name, max_attempts,
+                                  first_url, firecrawl_api_key, llm_provider,
                                   ollama_host, ollama_api_key, processed_urls, total_urls, llm,
-                                  step2_union_retry_attempts: int = 2):
+                                  step2_union_retry_attempts: int = 2,
+                                  ablation_no_reflection: bool = False,
+                                  ablation_retry_merge_mode: str = "union"):
     """Process a single sub-URL and return the result."""
     print(f"📄 [{processed_urls}/{total_urls}] Processing URL: {sub_url}")
     
     success = False
     last_extracted_content = None
-    
+
+    if ablation_no_reflection:
+        max_attempts = 1
+
     for attempt in range(1, max_attempts + 1):
         if interrupted:
             print("🛑 Stopping the task due to the interrupt signal.")
@@ -1673,10 +2177,10 @@ async def process_single_sub_url(sub_url, wanted, api_key, model_name, max_attem
                 ),
                 max_actions_per_step=
                 1,
-                llm_timeout=180 if llm_provider.lower() == "google" else 240,
-                step_timeout=240 if llm_provider.lower() == "google" else 360,
+                llm_timeout=240 if llm_provider.lower() in ("google", "openrouter") else 300,
+                step_timeout=360 if llm_provider.lower() in ("google", "openrouter") else 420,
             )
-            step2_total_timeout = 500 if llm_provider.lower() == "google" else 1000
+            step2_total_timeout = 900 if llm_provider.lower() in ("google", "openrouter") else 1400
             try:
                 history = await asyncio.wait_for(agent.run(),
                                                  timeout=step2_total_timeout)
@@ -1709,14 +2213,19 @@ async def process_single_sub_url(sub_url, wanted, api_key, model_name, max_attem
             else:
                 print("No extracted content found; treating it as empty data")
                 evaluation_data = []
-            print("\nGemini is evaluating success/failure...")
-            is_successful, reason, data_summary = await evaluate_success_with_gemini(
-                llm, current_task, evaluation_data)
-
-            print(f"\nGemini judgment result:")
-            print(f"Success: {'Success' if is_successful else 'Failure'}")
-            print(f"Reason: {reason}")
-            print(f"Data summary: {data_summary}")
+            if ablation_no_reflection:
+                is_successful = bool(last_extracted_content)
+                reason = "ablation_no_reflection: treating non-empty extract as success"
+                data_summary = ""
+                print(f"\n[ablation_no_reflection] Treating result as: {'Success' if is_successful else 'Failure'}")
+            else:
+                print("\nGemini is evaluating success/failure...")
+                is_successful, reason, data_summary = await evaluate_success_with_gemini(
+                    llm, current_task, evaluation_data)
+                print(f"\nGemini judgment result:")
+                print(f"Success: {'Success' if is_successful else 'Failure'}")
+                print(f"Reason: {reason}")
+                print(f"Data summary: {data_summary}")
 
             if is_successful:
                 print("✅ Success")
@@ -1773,11 +2282,11 @@ async def process_single_sub_url(sub_url, wanted, api_key, model_name, max_attem
                                 ),
                                 max_actions_per_step=
                                 1,
-                                llm_timeout=180 if llm_provider.lower() == "google" else 240,
-                                step_timeout=240 if llm_provider.lower() == "google" else 360,
+                                llm_timeout=240 if llm_provider.lower() in ("google", "openrouter") else 300,
+                                step_timeout=360 if llm_provider.lower() in ("google", "openrouter") else 420,
                             )
                             history = None
-                            step3_total_timeout = 1000 if llm_provider.lower() == "google" else 2000
+                            step3_total_timeout = 1500 if llm_provider.lower() in ("google", "openrouter") else 2400
                             history = await asyncio.wait_for(
                                 retry_agent.run(), timeout=step3_total_timeout)
 
@@ -1926,11 +2435,47 @@ async def process_single_sub_url(sub_url, wanted, api_key, model_name, max_attem
                     merged_content += "- Video(s):\n"
                     for video_item in sorted(merged_video_items):
                         merged_content += f"  - {video_item}\n"
-                    last_extracted_content = {
-                        'history_index': all_attempts_content[0]['history_index'],
-                        'result_index': all_attempts_content[0]['result_index'],
-                        'content': merged_content
-                    }
+                    if ablation_retry_merge_mode == "last":
+                        last_extracted_content = all_attempts_content[-1]
+                        print(f"[ablation_retry_merge_mode=last] Using last attempt's content (index {len(all_attempts_content)-1}).")
+                    elif ablation_retry_merge_mode == "best":
+                        def _attempt_score(att):
+                            r = check_sections(att['content'])
+                            text_n = len(re.findall(r"^\s+-\s+(.+)$", r.get('text_block') or "", re.MULTILINE))
+                            image_n = len(re.findall(r"^\s+-\s+(.+)$", r.get('image_block') or "", re.MULTILINE))
+                            video_n = len(re.findall(r"^\s+-\s+(.+)$", r.get('video_block') or "", re.MULTILINE))
+                            return text_n + image_n + video_n
+                        scored = [(idx, _attempt_score(att)) for idx, att in enumerate(all_attempts_content)]
+                        best_idx = max(scored, key=lambda kv: (kv[1], kv[0]))[0]
+                        last_extracted_content = all_attempts_content[best_idx]
+                        print(f"[ablation_retry_merge_mode=best] Using attempt index {best_idx} with score {scored[best_idx][1]}.")
+                    elif ablation_retry_merge_mode == "last_and_best":
+                        # Combined mode: surface BOTH last and best selections from the same retry pool
+                        # so a single Step 2 run can serve two ablation conditions. Downstream (main.py
+                        # step2 mode) detects the _combined_marker dict and writes two jsonl files.
+                        last_choice = all_attempts_content[-1]
+                        def _attempt_score_lab(att):
+                            r = check_sections(att['content'])
+                            text_n = len(re.findall(r"^\s+-\s+(.+)$", r.get('text_block') or "", re.MULTILINE))
+                            image_n = len(re.findall(r"^\s+-\s+(.+)$", r.get('image_block') or "", re.MULTILINE))
+                            video_n = len(re.findall(r"^\s+-\s+(.+)$", r.get('video_block') or "", re.MULTILINE))
+                            return text_n + image_n + video_n
+                        _scored_lab = [(idx, _attempt_score_lab(att)) for idx, att in enumerate(all_attempts_content)]
+                        _best_idx_lab = max(_scored_lab, key=lambda kv: (kv[1], kv[0]))[0]
+                        best_choice = all_attempts_content[_best_idx_lab]
+                        last_extracted_content = {
+                            '_combined_marker': True,
+                            'last': last_choice,
+                            'best': best_choice,
+                        }
+                        print(f"[ablation_retry_merge_mode=last_and_best] last_idx={len(all_attempts_content)-1} "
+                              f"best_idx={_best_idx_lab} (score {_scored_lab[_best_idx_lab][1]}).")
+                    else:
+                        last_extracted_content = {
+                            'history_index': all_attempts_content[0]['history_index'],
+                            'result_index': all_attempts_content[0]['result_index'],
+                            'content': merged_content
+                        }
                     final_result = check_sections(merged_content)
                     print(f"✅ Union merge completed:")
                     print(f"   - text: {len(merged_text_items)} (exists: {final_result['text_exists']})")
@@ -1955,39 +2500,42 @@ async def process_single_sub_url(sub_url, wanted, api_key, model_name, max_attem
                 success = True
                 break
             else:
-                analysis_prompt = get_failure_analysis_prompt(
-                    current_task, long_term_memories, attempt)
-                feedback = await get_feedback_from_gemini(
-                    llm, analysis_prompt)
-
-                if feedback:
-                    print(f"\nGemini feedback:")
-                    print(feedback)
-                    parsed_feedback = parse_gemini_feedback(
-                        feedback)
-                    if parsed_feedback:
-                        print(f"\n🔍 Parsed feedback:")
-                        print(
-                            f"Failure type: {parsed_feedback.get('failure_type', 'Unknown')}"
-                        )
-                        print(
-                            f"Improvements: {parsed_feedback.get('improvements', [])}"
-                        )
-                        improved_prompt = parsed_feedback.get(
-                            'improved_prompt', current_task)
-                        if improved_prompt != current_task:
-                            print(f"\nPrompt improved!")
-                            current_task = improved_prompt
-                        save_feedback_history(
-                            attempt, current_task,
-                            long_term_memories, feedback,
-                            improved_prompt)
-                    else:
-                        print("Feedback parsing failed")
+                if ablation_no_reflection:
+                    print("[ablation_no_reflection] Skipping failure analysis and feedback loop.")
                 else:
-                    print("Gemini feedback request failed")
+                    analysis_prompt = get_failure_analysis_prompt(
+                        current_task, long_term_memories, attempt)
+                    feedback = await get_feedback_from_gemini(
+                        llm, analysis_prompt)
 
-                print(f"\nUsing the improved prompt for the next attempt...")
+                    if feedback:
+                        print(f"\nGemini feedback:")
+                        print(feedback)
+                        parsed_feedback = parse_gemini_feedback(
+                            feedback)
+                        if parsed_feedback:
+                            print(f"\n🔍 Parsed feedback:")
+                            print(
+                                f"Failure type: {parsed_feedback.get('failure_type', 'Unknown')}"
+                            )
+                            print(
+                                f"Improvements: {parsed_feedback.get('improvements', [])}"
+                            )
+                            improved_prompt = parsed_feedback.get(
+                                'improved_prompt', current_task)
+                            if improved_prompt != current_task:
+                                print(f"\nPrompt improved!")
+                                current_task = improved_prompt
+                            save_feedback_history(
+                                attempt, current_task,
+                                long_term_memories, feedback,
+                                improved_prompt)
+                        else:
+                            print("Feedback parsing failed")
+                    else:
+                        print("Gemini feedback request failed")
+
+                    print(f"\nUsing the improved prompt for the next attempt...")
 
         except Exception as e:
             print(f"❌ Error while processing URL: {e}")
@@ -2026,7 +2574,11 @@ async def run_step2(wanted,
                     llm_provider: str = "google",
                     ollama_host: Optional[str] = None,
                     ollama_api_key: Optional[str] = None,
-                    step2_union_retry_attempts: int = 2):
+                    step2_union_retry_attempts: int = 2,
+                    ablation_no_reflection: bool = False,
+                    ablation_retry_merge_mode: str = "union",
+                    step2_model_name: Optional[str] = None,
+                    step2_concurrency: int = 1):
     """Async generator that processes each sub-URL and yields results."""
     attachment_path = None
     processed_urls = 0
@@ -2067,7 +2619,11 @@ async def run_step2(wanted,
         if total_urls == 0:
             print("⚠️ No URLs to process.")
             return
-        step2_model = model_name if llm_provider == "ollama" else "gemini-3-flash-preview"
+        if step2_model_name:
+            step2_model = step2_model_name
+        else:
+            step2_model = "gemini-3-flash-preview" if llm_provider.lower() == "google" else model_name
+        print(f"🤖 Step 2 model: {step2_model} (provider: {llm_provider})")
         llm = create_llm(
             provider=llm_provider,
             model_name=step2_model,
@@ -2080,32 +2636,61 @@ async def run_step2(wanted,
         )
         
 
-        for i in data["by_depth"]:
-            if not data["by_depth"][i]:
-                print(f"⚠️ Skipping depth {i} because it has no URLs.")
+        flat_urls = []
+        for depth_key in sorted(data["by_depth"].keys(), key=lambda k: int(k)):
+            urls_at_depth = data["by_depth"][depth_key]
+            if not urls_at_depth:
+                print(f"⚠️ Skipping depth {depth_key} because it has no URLs.")
                 continue
-            if interrupted:
-                print("🛑 Stopping the task due to the interrupt signal.")
-                break
+            flat_urls.extend(urls_at_depth)
 
-            print(f"🔍 Processing depth {i}...")
-            for sub_url in data["by_depth"][i]:
+        concurrency = max(1, int(step2_concurrency))
+        print(f"🚀 Step 2 concurrency: {concurrency} (flattened {len(flat_urls)} URLs across depths)")
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _one(sub_url, page_index):
+            async with sem:
+                if interrupted:
+                    return sub_url, False, None, page_index
+                success, content = await process_single_sub_url(
+                    sub_url, wanted, api_key, model_name, max_attempts,
+                    first_url, firecrawl_api_key, llm_provider,
+                    ollama_host, ollama_api_key, page_index + 1, total_urls, llm,
+                    step2_union_retry_attempts=step2_union_retry_attempts,
+                    ablation_no_reflection=ablation_no_reflection,
+                    ablation_retry_merge_mode=ablation_retry_merge_mode,
+                )
+                return sub_url, success, content, page_index
+
+        tasks = [
+            asyncio.create_task(_one(sub_url, idx))
+            for idx, sub_url in enumerate(flat_urls)
+        ]
+
+        try:
+            for coro in asyncio.as_completed(tasks):
                 if interrupted:
                     print("🛑 Stopping the task due to the interrupt signal.")
                     break
-
+                try:
+                    sub_url, success, content, page_index = await coro
+                except asyncio.CancelledError:
+                    continue
+                except Exception as e:
+                    print(f"❌ Error in Step 2 worker: {e}")
+                    continue
                 processed_urls += 1
-                success, last_extracted_content = await process_single_sub_url(
-                    sub_url, wanted, api_key, model_name, max_attempts,
-                    first_url, firecrawl_api_key, llm_provider,
-                    ollama_host, ollama_api_key, processed_urls, total_urls, llm,
-                    step2_union_retry_attempts=step2_union_retry_attempts
-                )
-                if success and last_extracted_content:
-                    page_index = processed_urls - 1  # 0-based index
-                    yield sub_url, last_extracted_content, page_index
+                if success and content:
+                    yield sub_url, content, page_index
                 elif not success:
                     print(f"⚠️ URL {sub_url} processing failed - continuing to the next URL")
+        finally:
+            pending = [t for t in tasks if not t.done()]
+            if pending:
+                print(f"🧹 Cancelling {len(pending)} pending Step 2 task(s)...")
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
 
     except Exception as e:
         print(f"❌ Overall process error: {e}")
@@ -2395,6 +2980,25 @@ class PipelineConfig:
     step2_union_retry_attempts: int
     step3_batch_size: int
     step3_batch_retries: int
+    ablation_no_bfs: bool
+    ablation_prompt_bfs: bool
+    ablation_llm_bfs: bool
+    ablation_no_reflection: bool
+    ablation_retry_merge_mode: str
+    ablation_no_download_verify: bool
+    step2_model_name: Optional[str]
+    step2_concurrency: int
+    # ---- verification module (artifact-unit 5-gate verification) ----
+    enable_verification: bool
+    verification_mode: str                   # "strict" | "audit" | "collection_only"
+    verification_output_dir: str
+    verification_keep_files: bool
+    verification_capture_timeout_ms: int
+    verification_download_timeout_image_s: int
+    verification_download_timeout_video_s: int
+    verification_max_bytes_image: int
+    verification_max_bytes_video: int
+    enable_annotation: bool
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2406,7 +3010,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs='+',
         default=None,
         help=
-        "API keys (required for Google provider; provide your own keys, space-separated. Not needed for Ollama).")
+        "API keys (required for Google and OpenRouter providers; provide your own keys, space-separated. Not needed for Ollama).")
     parser.add_argument(
         '--wanted',
         type=str,
@@ -2453,8 +3057,8 @@ def build_parser() -> argparse.ArgumentParser:
         '--llm_provider',
         type=str,
         default='google',
-        choices=['google', 'ollama'],
-        help='LLM provider to use: "google" or "ollama" (default: google)'
+        choices=['google', 'ollama', 'openrouter'],
+        help='LLM provider to use: "google", "ollama", or "openrouter" (default: google)'
     )
     parser.add_argument(
         '--ollama_host',
@@ -2467,6 +3071,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help='Ollama API key for remote models (e.g., gemini-3-pro-preview). Can also use GEMINI_API_KEY or GOOGLE_API_KEY env var.'
+    )
+    parser.add_argument(
+        '--openrouter_base_url',
+        type=str,
+        default=None,
+        help='Override OpenRouter API base URL (default: https://openrouter.ai/api/v1, also reads OPENROUTER_BASE_URL).'
+    )
+    parser.add_argument(
+        '--openrouter_http_referer',
+        type=str,
+        default=None,
+        help='Optional HTTP-Referer header for OpenRouter request attribution (also reads OPENROUTER_HTTP_REFERER).'
     )
     parser.add_argument(
         '--step1_only',
@@ -2503,6 +3119,139 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="Retry attempts per Step3 batch classification."
     )
+    parser.add_argument(
+        '--ablation_no_bfs',
+        action='store_true',
+        help='Ablation: replace Step 1 BFS prompt with the legacy autonomous prompt (LLM browses freely).'
+    )
+    parser.add_argument(
+        '--ablation_prompt_bfs',
+        action='store_true',
+        help='Ablation: use the legacy inline BFS prompt (LLM-driven BFS) instead of the new Rule BFS default.'
+    )
+    parser.add_argument(
+        '--ablation_llm_bfs',
+        action='store_true',
+        help='Ablation: use the LLM per-page anchor worker (previous Rule BFS default) '
+             'instead of the new deterministic Playwright BFS. Step 1 default is now '
+             'a no-LLM Playwright crawler; this flag opts back into the LLM-driven extraction.'
+    )
+    parser.add_argument(
+        '--ablation_no_reflection',
+        action='store_true',
+        help='Ablation: disable reflection (success eval + failure feedback + improved prompt) in Step 1 and Step 2; force a single attempt'
+    )
+    parser.add_argument(
+        '--ablation_retry_merge_mode',
+        type=str,
+        default='union',
+        choices=['union', 'last', 'best', 'last_and_best'],
+        help='Step 2 retry-merge strategy. union = current union merge. last = pick last attempt. '
+             'best = pick attempt with most text+image+video items. '
+             'last_and_best = run Step 2 once and emit BOTH last and best selections via two jsonl '
+             'files (use with --step2_results_file_secondary). Only valid in --run_mode step2.'
+    )
+    parser.add_argument(
+        '--ablation_no_download_verify',
+        action='store_true',
+        help='Ablation: skip PIL validation in download_image and yt_dlp fallback in download_video'
+    )
+    parser.add_argument(
+        '--step2_model_name',
+        type=str,
+        default=None,
+        help='Override the model used for Step 2 only. If unset, falls back to legacy logic '
+             '("gemini-3-flash-preview" for google provider, --model_name otherwise). '
+             'Example: --step2_model_name google/gemini-3-flash-preview for openrouter.'
+    )
+    parser.add_argument(
+        '--step2_concurrency',
+        type=int,
+        default=1,
+        help='Number of sub_urls processed concurrently in Step 2. Each concurrent worker '
+             'launches its own browser-use Agent and consumes API quota independently. '
+             'Total live browsers per machine = (sites in parallel) × step2_concurrency.'
+    )
+    # -------- verification (5-gate artifact-unit verification) ----------
+    parser.add_argument(
+        '--enable_verification',
+        action='store_true',
+        help='Enable the 5-gate artifact verification module between Step 2 and Step 3. '
+             'Each extracted image/video URL is checked for source-page observation, '
+             'downloadability, MIME match, hash-dedup, and hallucination risk; per-artifact '
+             'records and a site summary are written under --verification_output_dir.'
+    )
+    parser.add_argument(
+        '--verification_mode',
+        type=str,
+        default='strict',
+        choices=['strict', 'audit', 'collection_only'],
+        help='Verification gating policy. strict = all 5 gates must pass to include. '
+             'audit = ignore gate 5 (still record). collection_only = skip gates 1 and 5 '
+             '(useful for post-hoc evaluation without page-context capture).'
+    )
+    parser.add_argument(
+        '--verification_output_dir',
+        type=str,
+        default='verification_out',
+        help='Root directory for verification artifacts/records/summary (per-site subdir).'
+    )
+    parser.add_argument(
+        '--verification_no_keep_files',
+        action='store_true',
+        help='If set, downloaded artifact bytes are discarded after verification '
+             '(only records + summary remain).'
+    )
+    parser.add_argument(
+        '--verification_capture_timeout_ms',
+        type=int,
+        default=60_000,
+        help='Per-page Playwright capture timeout in milliseconds (gate 1 raw material). '
+             'Heavy SPA pages may need 90000+; static pages settle well under 30000.'
+    )
+    parser.add_argument(
+        '--verification_download_timeout_image_s',
+        type=int,
+        default=30,
+        help='Per-image HTTP download timeout in seconds (gate 2/3). '
+             'Most images are 1-5 MB; 30 s is generous.'
+    )
+    parser.add_argument(
+        '--verification_download_timeout_video_s',
+        type=int,
+        default=600,
+        help='Per-video HTTP download timeout in seconds (gate 2/3). '
+             'Default 600 s (10 min) covers HD/long-form clips on slow connections. '
+             'Tighten to 240 for fast-only sites; loosen to 1200+ for multi-GB files.'
+    )
+    parser.add_argument(
+        '--verification_max_bytes_image',
+        type=int,
+        default=50 * 1024 * 1024,
+        help='Per-image hard size ceiling in bytes (default 50 MB).'
+    )
+    parser.add_argument(
+        '--verification_max_bytes_video',
+        type=int,
+        default=2 * 1024 * 1024 * 1024,
+        help='Per-video hard size ceiling in bytes (default 2 GB). '
+             'Caps runaway downloads (e.g. accidental links to raw multi-GB files) '
+             'while comfortably fitting documentary-length HD content.'
+    )
+    parser.add_argument(
+        '--enable_annotation',
+        action='store_true',
+        default=True,
+        help='Generate ground-truth annotation files (annotations/page_*.json) for '
+             'each source page via Playwright (LLM-free). Default ON; pass '
+             '--no_annotation to disable.'
+    )
+    parser.add_argument(
+        '--no_annotation',
+        dest='enable_annotation',
+        action='store_false',
+        help='Disable annotation file generation.'
+    )
     return parser
 
 
@@ -2511,6 +3260,12 @@ def build_config_from_args(args: argparse.Namespace) -> PipelineConfig:
     if args.wanted_file:
         with open(args.wanted_file, "r", encoding="utf-8") as f:
             wanted = f.read()
+    if getattr(args, "openrouter_base_url", None):
+        os.environ["OPENROUTER_BASE_URL"] = args.openrouter_base_url
+    if getattr(args, "openrouter_http_referer", None):
+        os.environ["OPENROUTER_HTTP_REFERER"] = args.openrouter_http_referer
+    global _DOWNLOAD_VERIFY_ENABLED
+    _DOWNLOAD_VERIFY_ENABLED = not args.ablation_no_download_verify
     return PipelineConfig(
         api_keys=args.api_keys,
         wanted=wanted,
@@ -2531,6 +3286,24 @@ def build_config_from_args(args: argparse.Namespace) -> PipelineConfig:
         step2_union_retry_attempts=args.step2_union_retry_attempts,
         step3_batch_size=args.step3_batch_size,
         step3_batch_retries=args.step3_batch_retries,
+        ablation_no_bfs=args.ablation_no_bfs,
+        ablation_prompt_bfs=args.ablation_prompt_bfs,
+        ablation_llm_bfs=args.ablation_llm_bfs,
+        ablation_no_reflection=args.ablation_no_reflection,
+        ablation_retry_merge_mode=args.ablation_retry_merge_mode,
+        ablation_no_download_verify=args.ablation_no_download_verify,
+        step2_model_name=args.step2_model_name,
+        step2_concurrency=args.step2_concurrency,
+        enable_verification=getattr(args, "enable_verification", False),
+        verification_mode=getattr(args, "verification_mode", "strict"),
+        verification_output_dir=getattr(args, "verification_output_dir", "verification_out"),
+        verification_keep_files=not getattr(args, "verification_no_keep_files", False),
+        verification_capture_timeout_ms=getattr(args, "verification_capture_timeout_ms", 60_000),
+        verification_download_timeout_image_s=getattr(args, "verification_download_timeout_image_s", 30),
+        verification_download_timeout_video_s=getattr(args, "verification_download_timeout_video_s", 600),
+        verification_max_bytes_image=getattr(args, "verification_max_bytes_image", 50 * 1024 * 1024),
+        verification_max_bytes_video=getattr(args, "verification_max_bytes_video", 2 * 1024 * 1024 * 1024),
+        enable_annotation=getattr(args, "enable_annotation", True),
     )
 
 
@@ -2541,6 +3314,8 @@ class StepByStepPipelineRunner:
     def _validate_provider(self, parser: argparse.ArgumentParser):
         if self.config.llm_provider == "google" and not self.config.api_keys:
             parser.error("--api_keys is required when using the Google provider.")
+        if self.config.llm_provider == "openrouter" and not self.config.api_keys and not os.getenv("OPENROUTER_API_KEY"):
+            parser.error("--api_keys (or OPENROUTER_API_KEY env var) is required when using the OpenRouter provider.")
 
     def _check_ollama(self):
         if self.config.llm_provider != "ollama":
@@ -2614,8 +3389,8 @@ class StepByStepPipelineRunner:
         while current_api_key_index < len(api_keys):
             try:
                 api_key = api_keys[current_api_key_index]
-                if self.config.llm_provider == "google":
-                    print(f"🔑 API key {current_api_key_index + 1}/{len(api_keys)} in use...")
+                if self.config.llm_provider in ("google", "openrouter"):
+                    print(f"🔑 API key {current_api_key_index + 1}/{len(api_keys)} in use ({self.config.llm_provider})...")
                 else:
                     print("🔍 Using Ollama model...")
 
@@ -2646,7 +3421,11 @@ class StepByStepPipelineRunner:
                         max_attempts=self.config.max_attempts,
                         llm_provider=self.config.llm_provider,
                         ollama_host=self.config.ollama_host,
-                        ollama_api_key=self.config.ollama_api_key)
+                        ollama_api_key=self.config.ollama_api_key,
+                        ablation_no_bfs=self.config.ablation_no_bfs,
+                        ablation_prompt_bfs=self.config.ablation_prompt_bfs,
+                        ablation_llm_bfs=self.config.ablation_llm_bfs,
+                        ablation_no_reflection=self.config.ablation_no_reflection)
                     if result:
                         history, attachment_path = result
                         print(f"📁 attachment_path: {attachment_path}")
@@ -2675,7 +3454,8 @@ class StepByStepPipelineRunner:
                         llm_provider=self.config.llm_provider,
                         ollama_host=self.config.ollama_host,
                         ollama_api_key=self.config.ollama_api_key,
-                        step2_union_retry_attempts=self.config.step2_union_retry_attempts):
+                        step2_union_retry_attempts=self.config.step2_union_retry_attempts,
+                        step2_concurrency=self.config.step2_concurrency):
                     print(f"\n{'='*80}")
                     print(f"🔗 Processing URL: {sub_url}")
                     print(f"📄 Page index: {page_index}")
