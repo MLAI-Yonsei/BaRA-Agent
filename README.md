@@ -4,6 +4,9 @@ BaRA is a deterministic Playwright-based crawler combined with an LLM-driven
 content extraction and an LLM-free verification module that filters
 hallucinated and unverifiable artifacts.
 
+Our paper is available at:
+https://github.com/MLAI-Yonsei/BaRA-Agent/blob/main/BaRA_paper.pdf
+
 ## Pipeline
 
 ```
